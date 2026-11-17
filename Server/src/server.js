@@ -1,6 +1,9 @@
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
+const admin = require("firebase-admin");
+if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.applicationDefault() });
+const AUTH_TIMEOUT_MS = 10000;
 const { directionFromAngles, raySphereDistance } = require("./combat");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -134,14 +137,34 @@ wss.on("connection", (ws) => {
     return;
   }
   const id = randomUUID();
-  clients.set(id, { ws, roomId: null, lastShotAt: 0, lastPoseAt: 0, lastPongAt: Date.now(), pose: null, hp: 100 });
-  send(ws, "welcome", { playerId: id, protocol: 1 });
+  clients.set(id, { ws, authenticated: false, uid: null, roomId: null, lastShotAt: 0, lastPoseAt: 0, lastPongAt: Date.now(), pose: null, hp: 100 });
+  const authTimer = setTimeout(() => { const p = clients.get(id); if (p && !p.authenticated) ws.close(4001, "Authentication timeout"); }, AUTH_TIMEOUT_MS);
   ws.on("pong", () => { const player = clients.get(id); if (player) player.lastPongAt = Date.now(); });
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     let message;
     try { message = JSON.parse(raw.toString()); }
     catch { return send(ws, "error", { code: "BAD_JSON" }); }
     if (!message || typeof message.type !== "string") return send(ws, "error", { code: "BAD_MESSAGE" });
+    if (message.type === "authenticate") {
+      if (clients.get(id)?.authenticated) return send(ws, "error", { code: "ALREADY_AUTHENTICATED" });
+      if (typeof message.idToken !== "string" || message.idToken.length < 100 || message.idToken.length > 10000) return send(ws, "error", { code: "INVALID_TOKEN" });
+      try {
+        const decoded = await admin.auth().verifyIdToken(message.idToken, true);
+        const player = clients.get(id);
+        if (!player) return;
+        player.authenticated = true;
+        player.uid = decoded.uid;
+        clearTimeout(authTimer);
+        send(ws, "authenticated", { uid: decoded.uid, isAnonymous: decoded.firebase?.sign_in_provider === "anonymous" });
+        send(ws, "welcome", { playerId: id, uid: decoded.uid, protocol: 1 });
+      } catch (error) {
+        send(ws, "error", { code: "AUTH_FAILED" });
+        ws.close(4003, "Authentication failed");
+      }
+      return;
+    }
+    const authenticatedPlayer = clients.get(id);
+    if (!authenticatedPlayer || !authenticatedPlayer.authenticated) return send(ws, "error", { code: "AUTH_REQUIRED" });
     switch (message.type) {
       case "find_match": joinQueue(id); break;
       case "cancel_queue": removeFromQueue(id); send(ws, "queue_cancelled"); break;
@@ -172,7 +195,7 @@ wss.on("connection", (ws) => {
       default: send(ws, "error", { code: "UNKNOWN_MESSAGE" });
     }
   });
-  ws.on("close", () => { removeFromQueue(id); leaveMatch(id); clients.delete(id); });
+  ws.on("close", () => { clearTimeout(authTimer); removeFromQueue(id); leaveMatch(id); clients.delete(id); });
   ws.on("error", () => {});
 });
 const heartbeat = setInterval(() => {

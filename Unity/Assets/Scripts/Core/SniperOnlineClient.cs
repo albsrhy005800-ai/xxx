@@ -9,6 +9,7 @@ namespace SniperOnline.Core
     {
         [SerializeField] private string serverUrl = "ws://127.0.0.1:8080";
         [SerializeField] private bool connectOnStart = false;
+        private string pendingIdToken;
 
         public event Action<string> StatusChanged;
         public event Action<string, int, string> MatchFound;
@@ -24,6 +25,8 @@ namespace SniperOnline.Core
 
         public string PlayerId { get; private set; }
         public string MatchId { get; private set; }
+        public string FirebaseUid { get; private set; }
+        public bool IsAuthenticated { get; private set; }
         public bool IsConnected => socket != null && socket.State == WebSocketState.Open;
 
         private WebSocket socket;
@@ -43,13 +46,19 @@ namespace SniperOnline.Core
         }
         [Serializable] private class Rules { public string mode, map; public int maxRangeMeters; }
 
-        private void Start() { if (connectOnStart) Connect(); }
+        private void Start() { if (connectOnStart) RaiseError("Sign in first, then call ConnectWithToken."); }
+        public void ConnectWithToken(string firebaseIdToken)
+        {
+            if (string.IsNullOrWhiteSpace(firebaseIdToken)) { RaiseError("Firebase ID token is missing."); return; }
+            pendingIdToken = firebaseIdToken;
+            Connect();
+        }
         public async void Connect()
         {
             if (socket != null && socket.State == WebSocketState.Open) return;
             if (string.IsNullOrWhiteSpace(serverUrl)) { RaiseStatus("Server URL is empty."); return; }
             socket = new WebSocket(serverUrl);
-            socket.OnOpen += () => Enqueue(() => RaiseStatus("Connected to game server."));
+            socket.OnOpen += () => Enqueue(() => { RaiseStatus("Connected. Authenticating..."); SendAuthToken(); });
             socket.OnError += error => Enqueue(() => RaiseError(error));
             socket.OnClose += code => Enqueue(() => RaiseStatus("Disconnected: " + code));
             socket.OnMessage += bytes => { string json = System.Text.Encoding.UTF8.GetString(bytes); Enqueue(() => HandleMessage(json)); };
@@ -60,7 +69,7 @@ namespace SniperOnline.Core
             if (socket == null) return;
             try { await socket.Close(); } catch (Exception ex) { RaiseError(ex.Message); }
         }
-        public void FindMatch() { Send(new Outgoing { type = "find_match" }); RaiseStatus("Searching for an opponent..."); }
+        public void FindMatch() { if (!IsAuthenticated) { RaiseError("Sign in before matchmaking."); return; } Send(new Outgoing { type = "find_match" }); RaiseStatus("Searching for an opponent..."); }
         public void CancelQueue() { Send(new Outgoing { type = "cancel_queue" }); }
         public void LeaveMatch() { Send(new Outgoing { type = "leave_match" }); MatchId = null; }
         public void SendAim(float yaw, float pitch) { Send(new AimMessage { yaw = Mathf.Clamp(yaw, -360f, 360f), pitch = Mathf.Clamp(pitch, -89f, 89f) }); }
@@ -70,6 +79,13 @@ namespace SniperOnline.Core
                 yaw = Mathf.Clamp(yaw, -360f, 360f), pitch = Mathf.Clamp(pitch, -89f, 89f) });
         }
         public void SendFire() { Send(new Outgoing { type = "fire" }); }
+        [Serializable] private class AuthMessage { public string type = "authenticate"; public string idToken; }
+        private async void SendAuthToken()
+        {
+            if (!IsConnected || string.IsNullOrEmpty(pendingIdToken)) { RaiseError("No Firebase token. Sign in again."); return; }
+            try { await socket.SendText(JsonUtility.ToJson(new AuthMessage { idToken = pendingIdToken })); pendingIdToken = null; }
+            catch (Exception ex) { RaiseError(ex.Message); }
+        }
         private async void Send(Outgoing message)
         {
             if (!IsConnected) { RaiseError("Not connected to the game server."); return; }
@@ -93,7 +109,8 @@ namespace SniperOnline.Core
             if (message == null || string.IsNullOrEmpty(message.type)) return;
             switch (message.type)
             {
-                case "welcome": PlayerId = message.playerId; RaiseStatus("Connected. Player ID: " + PlayerId); break;
+                case "authenticated": IsAuthenticated = true; FirebaseUid = message.uid; RaiseStatus("Account verified."); break;
+                case "welcome": PlayerId = message.playerId; FirebaseUid = message.uid; RaiseStatus("Connected. Player ID: " + PlayerId); break;
                 case "queue_joined": RaiseStatus("Waiting for another player..."); break;
                 case "match_found":
                     MatchId = message.matchId;
