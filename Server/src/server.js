@@ -2,7 +2,7 @@ const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 const admin = require("firebase-admin");
-if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.applicationDefault() });
+if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.applicationDefault(), projectId: process.env.FIREBASE_PROJECT_ID });
 const AUTH_TIMEOUT_MS = 10000;
 const { directionFromAngles, raySphereDistance } = require("./combat");
 

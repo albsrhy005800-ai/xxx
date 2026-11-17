@@ -38,7 +38,7 @@ namespace SniperOnline.Core
         [Serializable] private class PoseMessage { public string type = "pose"; public float x, y, z, yaw, pitch; }
         [Serializable] private class Incoming
         {
-            public string type, playerId, opponentId, matchId, code, reason, message;
+            public string type, playerId, opponentId, matchId, code, reason, message, uid;
             public string shooterId, victimId, winnerId, loserId, hitZone;
             public int spawnSlot, hp, damage, distanceMeters;
             public float x, y, z, yaw, pitch;
