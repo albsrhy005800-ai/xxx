@@ -7,7 +7,7 @@
 - The server uses the verified Firebase UID; it never trusts a UID supplied by the client.
 
 ## Firebase project setup
-1. Create a Firebase project in the Firebase Console.
+1. Use the Firebase project you created: **`abbas-f4f5`**. Open it in the Firebase Console and confirm the project ID matches exactly.
 2. Add your Android app using the exact Unity package/bundle ID.
 3. Enable **Authentication → Sign-in method → Anonymous** and **Google**.
 4. Download the Android `google-services.json` for this project and place it in the Unity project's `Assets/` folder. Do not commit this file unless you explicitly intend to publish its project configuration.
