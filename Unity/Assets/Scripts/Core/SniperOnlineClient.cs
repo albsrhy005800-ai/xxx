@@ -16,6 +16,7 @@ namespace SniperOnline.Core
         public event Action<string, Vector3, float, float> OpponentPose;
         public event Action<string> OpponentFired;
         public event Action<int, int, string> HealthChanged;
+        public event Action<int, int> OpponentHealthChanged;
         public event Action<int, string> HitConfirmed;
         public event Action<string, string, string> MatchEnded;
         public event Action OpponentLeft;
@@ -107,6 +108,7 @@ namespace SniperOnline.Core
                     RaiseStatus("You were hit: -" + message.damage + " HP.");
                     break;
                 case "hit_confirmed":
+                    OpponentHealthChanged?.Invoke(message.hp, 100);
                     HitConfirmed?.Invoke(message.damage, message.distanceMeters + " m");
                     RaiseStatus("Hit confirmed: -" + message.damage + " HP at " + message.distanceMeters + " m.");
                     break;
