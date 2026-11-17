@@ -4,7 +4,14 @@
   "private": true,
   "description": "Single authoritative WebSocket server and 1v1 matchmaking prototype",
   "main": "src/server.js",
-  "scripts": { "start": "node src/server.js" },
-  "engines": { "node": ">=20" },
-  "dependencies": { "ws": "^8.18.0" }
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }

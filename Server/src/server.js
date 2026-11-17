@@ -1,12 +1,16 @@
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
+const { directionFromAngles, raySphereDistance } = require("./combat");
 
 const PORT = Number(process.env.PORT || 8080);
 const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 500);
 const SHOT_COOLDOWN_MS = 1500;
 const POSE_INTERVAL_MS = 50;
 const MAX_MESSAGE_BYTES = 4096;
+const MAX_SHOT_RANGE = 2000;
+const HIT_RADIUS = 1.25;
+const BODY_DAMAGE = 100;
 const clients = new Map();
 const waiting = [];
 const rooms = new Map();
@@ -28,12 +32,12 @@ const wss = new WebSocketServer({ server, maxPayload: MAX_MESSAGE_BYTES, perMess
 function send(ws, type, data = {}) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, ...data }));
 }
+function sendPlayer(id, type, data = {}) {
+  const player = clients.get(id);
+  if (player) send(player.ws, type, data);
+}
 function broadcast(room, type, data = {}, exceptId = null) {
-  for (const id of room.players) {
-    if (id === exceptId) continue;
-    const player = clients.get(id);
-    if (player) send(player.ws, type, data);
-  }
+  for (const id of room.players) if (id !== exceptId) sendPlayer(id, type, data);
 }
 function removeFromQueue(id) {
   const index = waiting.indexOf(id);
@@ -41,7 +45,7 @@ function removeFromQueue(id) {
 }
 function createMatch(firstId, secondId) {
   const matchId = randomUUID();
-  const room = { id: matchId, players: [firstId, secondId], createdAt: Date.now() };
+  const room = { id: matchId, players: [firstId, secondId], createdAt: Date.now(), ended: false };
   rooms.set(matchId, room);
   for (const [index, id] of room.players.entries()) {
     const player = clients.get(id);
@@ -49,11 +53,13 @@ function createMatch(firstId, secondId) {
     player.roomId = matchId;
     player.lastShotAt = 0;
     player.lastPoseAt = 0;
+    player.hp = 100;
     player.pose = { x: index === 0 ? -500 : 500, y: 1, z: 0, yaw: index === 0 ? 90 : -90, pitch: 0 };
     send(player.ws, "match_found", {
       matchId, opponentId: room.players[1 - index], spawnSlot: index,
       spawnPosition: { x: player.pose.x, y: player.pose.y, z: player.pose.z },
-      rules: { mode: "1v1", map: "desert_4km", maxRangeMeters: 2000 }
+      hp: player.hp,
+      rules: { mode: "1v1", map: "desert_4km", maxRangeMeters: MAX_SHOT_RANGE }
     });
   }
 }
@@ -82,10 +88,45 @@ function leaveMatch(id) {
   broadcast(room, "opponent_left", { matchId: room.id }, id);
   for (const otherId of room.players) {
     const other = clients.get(otherId);
-    if (other) { other.roomId = null; other.pose = null; }
+    if (other) { other.roomId = null; other.pose = null; other.hp = 100; }
   }
 }
+function fireShot(id) {
+  const shooter = clients.get(id);
+  const room = shooter && rooms.get(shooter.roomId);
+  if (!room || room.ended) return sendPlayer(id, "error", { code: "NOT_IN_MATCH" });
+  const now = Date.now();
+  if (now - shooter.lastShotAt < SHOT_COOLDOWN_MS)
+    return sendPlayer(id, "shot_rejected", { reason: "COOLDOWN" });
+  shooter.lastShotAt = now;
+  const victimId = room.players.find(otherId => otherId !== id);
+  const victim = clients.get(victimId);
+  sendPlayer(victimId, "opponent_fired", { playerId: id, serverTime: now });
+  if (!victim || !shooter.pose || !victim.pose) {
+    return sendPlayer(id, "shot_missed", { reason: "NO_VALID_POSE" });
+  }
 
+  // Hit is decided only from the latest poses stored by this server.
+  // Clients cannot submit a target ID, hit point, or damage amount.
+  const origin = { x: shooter.pose.x, y: shooter.pose.y + 1, z: shooter.pose.z };
+  const center = { x: victim.pose.x, y: victim.pose.y + 1, z: victim.pose.z };
+  const direction = directionFromAngles(shooter.pose.yaw, shooter.pose.pitch);
+  const distance = raySphereDistance(origin, direction, center, HIT_RADIUS, MAX_SHOT_RANGE);
+  if (distance === null) return sendPlayer(id, "shot_missed", { reason: "NO_HIT" });
+
+  victim.hp = Math.max(0, victim.hp - BODY_DAMAGE);
+  const damageEvent = {
+    matchId: room.id, shooterId: id, victimId, damage: BODY_DAMAGE,
+    hp: victim.hp, hitZone: "body", distanceMeters: Math.round(distance)
+  };
+  sendPlayer(id, "hit_confirmed", damageEvent);
+  sendPlayer(victimId, "player_damaged", damageEvent);
+  if (victim.hp <= 0) {
+    room.ended = true;
+    const result = { matchId: room.id, winnerId: id, loserId: victimId, reason: "elimination" };
+    broadcast(room, "match_ended", result);
+  }
+}
 wss.on("connection", (ws) => {
   if (clients.size >= MAX_PLAYERS) {
     send(ws, "server_full");
@@ -93,40 +134,28 @@ wss.on("connection", (ws) => {
     return;
   }
   const id = randomUUID();
-  clients.set(id, { ws, roomId: null, lastShotAt: 0, lastPoseAt: 0, lastPongAt: Date.now(), pose: null });
+  clients.set(id, { ws, roomId: null, lastShotAt: 0, lastPoseAt: 0, lastPongAt: Date.now(), pose: null, hp: 100 });
   send(ws, "welcome", { playerId: id, protocol: 1 });
-
-  ws.on("pong", () => {
-    const player = clients.get(id);
-    if (player) player.lastPongAt = Date.now();
-  });
+  ws.on("pong", () => { const player = clients.get(id); if (player) player.lastPongAt = Date.now(); });
   ws.on("message", (raw) => {
     let message;
     try { message = JSON.parse(raw.toString()); }
     catch { return send(ws, "error", { code: "BAD_JSON" }); }
-    if (!message || typeof message.type !== "string")
-      return send(ws, "error", { code: "BAD_MESSAGE" });
-
+    if (!message || typeof message.type !== "string") return send(ws, "error", { code: "BAD_MESSAGE" });
     switch (message.type) {
       case "find_match": joinQueue(id); break;
-      case "cancel_queue":
-        removeFromQueue(id);
-        send(ws, "queue_cancelled");
-        break;
+      case "cancel_queue": removeFromQueue(id); send(ws, "queue_cancelled"); break;
       case "leave_match": leaveMatch(id); break;
       case "aim": {
-        const player = clients.get(id);
-        const room = player && rooms.get(player.roomId);
+        const player = clients.get(id), room = player && rooms.get(player.roomId);
         const yaw = Number(message.yaw), pitch = Number(message.pitch);
-        if (!room || !Number.isFinite(yaw) || !Number.isFinite(pitch) ||
-            Math.abs(yaw) > 360 || Math.abs(pitch) > 89) return;
+        if (!room || !Number.isFinite(yaw) || !Number.isFinite(pitch) || Math.abs(yaw) > 360 || Math.abs(pitch) > 89) return;
         broadcast(room, "opponent_aim", { playerId: id, yaw, pitch }, id);
         break;
       }
       case "pose": {
-        const player = clients.get(id);
-        const room = player && rooms.get(player.roomId);
-        if (!room) return;
+        const player = clients.get(id), room = player && rooms.get(player.roomId);
+        if (!room || room.ended) return;
         const now = Date.now();
         if (now - player.lastPoseAt < POSE_INTERVAL_MS) return;
         const x = Number(message.x), y = Number(message.y), z = Number(message.z);
@@ -139,26 +168,13 @@ wss.on("connection", (ws) => {
         broadcast(room, "opponent_pose", { playerId: id, ...player.pose, serverTime: now }, id);
         break;
       }
-      case "fire": {
-        const player = clients.get(id);
-        const room = player && rooms.get(player.roomId);
-        if (!room) return send(ws, "error", { code: "NOT_IN_MATCH" });
-        const now = Date.now();
-        if (now - player.lastShotAt < SHOT_COOLDOWN_MS)
-          return send(ws, "shot_rejected", { reason: "COOLDOWN" });
-        player.lastShotAt = now;
-        // Prototype relay only: server-side trajectory, hit validation and damage are not implemented.
-        broadcast(room, "opponent_fired", { playerId: id, serverTime: now }, id);
-        send(ws, "shot_accepted", { serverTime: now });
-        break;
-      }
+      case "fire": fireShot(id); break;
       default: send(ws, "error", { code: "UNKNOWN_MESSAGE" });
     }
   });
   ws.on("close", () => { removeFromQueue(id); leaveMatch(id); clients.delete(id); });
   ws.on("error", () => {});
 });
-
 const heartbeat = setInterval(() => {
   for (const [id, player] of clients) {
     if (Date.now() - player.lastPongAt > 45000) { player.ws.terminate(); continue; }
